@@ -1,4 +1,4 @@
-faiss-cpu==1.8.0
+faiss-cpu==1.7.4
 sentence-transformers==3.0.1
 google-generativeai==0.8.1
 numpy==1.26.4

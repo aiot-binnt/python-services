@@ -44,10 +44,13 @@ class EmbeddingRequest(BaseModel):
     text: str
 
 class FAISSService:
+    # đường dẫn chạy local 
     # def __init__(self, index_path="F:/ThucTap/chatbot-agent/python_services/faiss_index"):
     #     self.dimension = 768
     #     self.index_path = index_path
     #     self.metadata_path = index_path + "_metadata.json"
+
+    # đường dẫn chạy trên server
     def __init__(self, index_path=None):
         self.dimension = 768
         if index_path is None:
@@ -550,6 +553,8 @@ async def list_vectors():
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to list vectors: {str(e)}")
 
+
+# chạy trên server không cần thiết khai báo port
 # if __name__ == "__main__":
 #     import uvicorn
 #     uvicorn.run(app, host="0.0.0.0", port=8001)

@@ -9,44 +9,199 @@ import json
 from openai import OpenAI
 from dotenv import load_dotenv
 import math
- 
-# setting logging
+import re
+
+# Setting logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
- 
+
 load_dotenv()
- 
+
 try:
     client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 except Exception as e:
     raise Exception(f"Failed to configure OpenAI API: {e}")
- 
+
+# Try to load cross-encoder for re-ranking (optional)
+try:
+    from sentence_transformers import CrossEncoder
+    cross_encoder = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
+    logger.info("✓ Cross-encoder loaded successfully")
+except ImportError:
+    cross_encoder = None
+    logger.warning("⚠ sentence-transformers not installed, re-ranking disabled")
+except Exception as e:
+    cross_encoder = None
+    logger.warning(f"⚠ Failed to load cross-encoder: {e}")
+
+# Try to load langdetect (optional)
+try:
+    from langdetect import detect, LangDetectException
+    LANGDETECT_AVAILABLE = True
+    logger.info("✓ langdetect available")
+except ImportError:
+    LANGDETECT_AVAILABLE = False
+    logger.warning("⚠ langdetect not installed, using basic detection")
+
+# Env vars for models/thresholds
+EMBEDDING_MODEL = os.getenv('OPENAI_EMBEDDING_MODEL', 'text-embedding-3-small')
+MIN_SCORE_THRESHOLD = float(os.getenv('MIN_SCORE_THRESHOLD', 0.5))
+logger.info(f"✓ Config: Embedding model={EMBEDDING_MODEL}, Min threshold={MIN_SCORE_THRESHOLD}")
+
 class VectorData(BaseModel):
     id: str
     values: List[float]
     metadata: Dict
- 
+
 class SearchRequest(BaseModel):
     query: str
     language: str
     top_k: int = 5
-    threshold: float = 0.5
- 
+    threshold: float = MIN_SCORE_THRESHOLD   
+
 class VectorSearchRequest(BaseModel):
     vector: List[float]
     language: str
     top_k: int = 5
-    threshold: float = 0.5
- 
+    threshold: float = MIN_SCORE_THRESHOLD 
+
 class DeleteRequest(BaseModel):
     ids: List[str]
- 
+
 class EmbeddingRequest(BaseModel):
     text: str
- 
+
+class ChunkRequest(BaseModel):
+    text: str
+    language: str
+    max_chunk_length: int = 1000
+    min_chunk_length: int = 20
+
+# ==================== SMART CHUNKER ====================
+class SmartChunker:
+    """Improved text chunking với language-aware rules"""
+    
+    LANGUAGE_RULES = {
+        'vi': {
+            'sentence_delimiters': r'(?<=[.!?])\s+',
+            'paragraph_delimiters': r'\n{2,}',
+        },
+        'en': {
+            'sentence_delimiters': r'(?<=[.!?])\s+',
+            'paragraph_delimiters': r'\n{2,}',
+        },
+        'ja': {
+            'sentence_delimiters': r'(?<=[。！？])\s*',
+            'paragraph_delimiters': r'\n{1,}',
+        },
+        'zh': {
+            'sentence_delimiters': r'(?<=[。！？])\s*',
+            'paragraph_delimiters': r'\n{1,}',
+        },
+        'ko': {
+            'sentence_delimiters': r'(?<=[.!?])\s*',
+            'paragraph_delimiters': r'\n{1,}',
+        }
+    }
+    
+    @classmethod
+    def is_char_based(cls, language: str) -> bool:
+        return language in ['ja', 'zh', 'ko']
+    
+    @classmethod
+    def calculate_length(cls, text: str, language: str) -> int:
+        if cls.is_char_based(language):
+            return len(text)
+        return len(text.split())
+    
+    @classmethod
+    def is_special_structure(cls, text: str) -> bool:
+        """Check if text is title, list, or table"""
+        text = text.strip()
+        # Check for lists
+        if re.match(r'^\s*[-•○●]\s+', text) or re.match(r'^\s*\d+\.\s+', text):
+            return True
+        # Check for tables
+        if '|' in text or text.count('\t') > 2:
+            return True
+        # Check for headers
+        if re.match(r'^#+\s+', text) or re.match(r'^[A-Z][A-Z\s]+:?$', text):
+            return True
+        return False
+    
+    @classmethod
+    def chunk_text(cls, text: str, language: str, max_length: int = 1000, min_length: int = 20) -> List[str]:
+        """
+        Smart chunking với semantic awareness
+        """
+        rules = cls.LANGUAGE_RULES.get(language, cls.LANGUAGE_RULES['en'])
+        
+        # Split into paragraphs
+        paragraphs = re.split(rules['paragraph_delimiters'], text.strip())
+        chunks = []
+        current_chunk = ""
+        current_length = 0
+        
+        for paragraph in paragraphs:
+            paragraph = paragraph.strip()
+            if not paragraph:
+                continue
+            
+            # Special structures as separate chunks
+            if cls.is_special_structure(paragraph):
+                if current_chunk and current_length >= min_length:
+                    chunks.append(current_chunk.strip())
+                    current_chunk = ""
+                    current_length = 0
+                chunks.append(paragraph)
+                continue
+            
+            para_length = cls.calculate_length(paragraph, language)
+            
+            # If paragraph fits
+            if para_length <= max_length:
+                if current_length + para_length <= max_length:
+                    current_chunk += ("\n\n" if current_chunk else "") + paragraph
+                    current_length += para_length
+                else:
+                    if current_chunk and current_length >= min_length:
+                        chunks.append(current_chunk.strip())
+                    current_chunk = paragraph
+                    current_length = para_length
+            else:
+                # Split into sentences
+                if current_chunk and current_length >= min_length:
+                    chunks.append(current_chunk.strip())
+                    current_chunk = ""
+                    current_length = 0
+                
+                sentences = re.split(rules['sentence_delimiters'], paragraph)
+                for sentence in sentences:
+                    sentence = sentence.strip()
+                    if not sentence:
+                        continue
+                    
+                    sent_length = cls.calculate_length(sentence, language)
+                    
+                    if current_length + sent_length <= max_length:
+                        current_chunk += (" " if current_chunk else "") + sentence
+                        current_length += sent_length
+                    else:
+                        if current_chunk and current_length >= min_length:
+                            chunks.append(current_chunk.strip())
+                        current_chunk = sentence
+                        current_length = sent_length
+        
+        # Add remaining
+        if current_chunk and current_length >= min_length:
+            chunks.append(current_chunk.strip())
+        
+        logger.info(f"✓ Chunked text: {len(chunks)} chunks (language: {language})")
+        return chunks
+
+# ==================== FAISS SERVICE ====================
 class FAISSService:
-    def __init__(self, index_path=None):
-        # self.dimension = 768
+    def __init__(self, index_path: Optional[str] = None):
         self.dimension = 1536
         if index_path is None:
             index_path = os.path.join(os.path.dirname(__file__), "faiss_index")
@@ -54,527 +209,431 @@ class FAISSService:
         self.metadata_path = index_path + "_metadata.json"
         self.documents = []
         self.id_to_index = {}
-        logger.info(f"Initializing FAISS with index_path: {index_path}")
+        logger.info(f"🔧 Initializing FAISS with index_path: {index_path}")
         os.makedirs(os.path.dirname(index_path), exist_ok=True)
         
         self._load_index_and_metadata()
- 
+
     def _load_index_and_metadata(self):
         try:
             if os.path.exists(self.index_path):
                 self.index = faiss.read_index(self.index_path)
-                logger.info(f"Loaded FAISS index from {self.index_path}")
+                logger.info(f"✓ Loaded FAISS index from {self.index_path}")
                 
                 if os.path.exists(self.metadata_path):
                     with open(self.metadata_path, 'r', encoding='utf-8') as f:
                         self.documents = json.load(f)
-                    logger.info(f"Loaded {len(self.documents)} documents metadata")
+                    logger.info(f"✓ Loaded {len(self.documents)} documents metadata")
                     
                     self.id_to_index = {doc.get('vector_id', f"content_{i}"): i for i, doc in enumerate(self.documents)}
-                    logger.info(f"Built id_to_index mapping: {self.id_to_index}")
                     
                     if self.index.ntotal != len(self.documents):
-                        logger.warning(f"Index and metadata out of sync: {self.index.ntotal} vectors vs {len(self.documents)} metadata entries")
+                        logger.warning(f"⚠ Index sync issue: {self.index.ntotal} vs {len(self.documents)}")
                         self._sync_index_and_metadata()
                 else:
-                    logger.info("No metadata file found, creating empty documents list")
                     self.documents = [{} for _ in range(self.index.ntotal)]
                     self.id_to_index = {f"content_{i}": i for i in range(self.index.ntotal)}
                     self._save_metadata()
             else:
-                logger.info(f"No existing FAISS index found at {self.index_path}")
-                self.index = faiss.IndexIDMap(faiss.IndexFlatL2(self.dimension))
+                logger.info("✓ Creating new FAISS index with Inner Product (cosine similarity)")
+                self.index = faiss.IndexFlatIP(self.dimension)
                 self.documents = []
                 self.id_to_index = {}
         except Exception as e:
-            logger.error(f"Failed to load FAISS index or metadata: {e}")
-            self.index = faiss.IndexIDMap(faiss.IndexFlatL2(self.dimension))
+            logger.error(f"❌ Failed to load FAISS: {e}")
+            self.index = faiss.IndexFlatIP(self.dimension)
             self.documents = []
             self.id_to_index = {}
- 
+
     def _sync_index_and_metadata(self):
         if self.index.ntotal < len(self.documents):
             self.documents = self.documents[:self.index.ntotal]
-            self.id_to_index = {doc.get('vector_id', f"content_{i}"): i for i, doc in enumerate(self.documents)}
         else:
             self.documents.extend([{} for _ in range(self.index.ntotal - len(self.documents))])
-            self.id_to_index = {f"content_{i}": i for i in range(self.index.ntotal)}
+        self.id_to_index = {doc.get('vector_id', f"content_{i}"): i for i, doc in enumerate(self.documents)}
         self._save_metadata()
- 
+
     def _save_metadata(self):
         try:
             with open(self.metadata_path, 'w', encoding='utf-8') as f:
                 json.dump(self.documents, f, ensure_ascii=False, indent=2)
-            logger.info(f"Saved metadata to {self.metadata_path}")
+            logger.info(f"✓ Saved metadata to {self.metadata_path}")
         except Exception as e:
-            logger.error(f"Failed to save metadata: {e}")
-            
- 
+            logger.error(f"❌ Failed to save metadata: {e}")
+
     def generate_embedding(self, text: str) -> List[float]:
         try:
             if not text or not text.strip():
-                raise ValueError("Empty text provided for embedding")
- 
- 
+                raise ValueError("Empty text")
+
             response = client.embeddings.create(
-                model="text-embedding-3-small",
+                model=EMBEDDING_MODEL,  
                 input=text
             )
             embedding = response.data[0].embedding
- 
- 
+
             if len(embedding) != self.dimension:
-                logger.warning(f"Embedding dimension mismatch: expected {self.dimension}, got {len(embedding)}")
- 
+                logger.warning(f"⚠ Dimension mismatch: {len(embedding)} (expected {self.dimension})")
+
             return embedding
- 
+
         except Exception as e:
-            logger.error(f"Failed to generate embedding: {e}")
-            raise HTTPException(status_code=500, detail=f"Failed to generate embedding: {e}")
- 
-        
- 
+            logger.error(f"❌ Failed to generate embedding: {e}")
+            raise HTTPException(status_code=500, detail=f"Embedding failed: {str(e)}")
+
     def upsert_vectors(self, vectors: List[VectorData]) -> List[str]:
         try:
-            logger.info(f"Received {len(vectors)} vectors for upsert")
+            logger.info(f"📥 Upserting {len(vectors)} vectors")
             
             valid_vectors = []
             valid_metadatas = []
             valid_ids = []
-            valid_id_nums = []
             
             for v in vectors:
                 if len(v.values) == self.dimension:
-                    # Normalize vector cho cosine
-                    normalized_values = np.array([v.values], dtype=np.float32)
-                    faiss.normalize_L2(normalized_values)
-                    valid_vectors.append(normalized_values[0].tolist())
+                    # Normalize for cosine similarity
+                    normalized = np.array([v.values], dtype=np.float32)
+                    faiss.normalize_L2(normalized)
+                    valid_vectors.append(normalized[0])
                     valid_metadatas.append({**v.metadata, 'vector_id': v.id})
                     valid_ids.append(v.id)
-                    try:
-                        id_num = int(v.id.replace('content_', ''))
-                        valid_id_nums.append(id_num)
-                    except ValueError:
-                        logger.warning(f"Invalid vector ID format: {v.id}, skipping")
-                        continue
                 else:
-                    logger.warning(f"Skipping vector {v.id} with invalid dimension: {len(v.values)}")
+                    logger.warning(f"⚠ Skip {v.id}: dimension {len(v.values)} (expected {self.dimension})")
             
             if not valid_vectors:
-                raise ValueError("No valid vectors to upsert")
+                raise ValueError("No valid vectors")
             
             embeddings = np.array(valid_vectors, dtype=np.float32)
-            ids = np.array(valid_id_nums, dtype=np.int64)
-            logger.info(f"Valid embeddings shape: {embeddings.shape}, IDs: {ids}")
             
-            # Cải thiện index: Sử dụng IndexIVFFlat nếu index lớn
-            n_vectors = self.index.ntotal + len(embeddings)
-            nlist = max(1, int(math.sqrt(n_vectors)))  # nlist ≈ sqrt(n)
-            if not isinstance(self.index, faiss.IndexIVFFlat):
-                quantizer = faiss.IndexFlatIP(self.dimension)  # Chuyển sang IP cho cosine
-                new_index = faiss.IndexIVFFlat(quantizer, self.dimension, nlist)
-                new_index.train(embeddings)  # Train nếu cần
-                self.index = new_index
-            
-            self.index.add_with_ids(embeddings, ids)
+            # Add to index
+            self.index.add(embeddings)
             self.documents.extend(valid_metadatas)
-            self.id_to_index.update({v.id: len(self.documents) - len(valid_ids) + i for i, v in enumerate(vectors) if v.id in valid_ids})
+            
+            # Update mapping
+            start_idx = len(self.documents) - len(valid_ids)
+            for i, vid in enumerate(valid_ids):
+                self.id_to_index[vid] = start_idx + i
             
             faiss.write_index(self.index, self.index_path)
             self._save_metadata()
             
-            logger.info(f"Vectors upserted successfully. Total vectors: {self.index.ntotal}")
+            logger.info(f"✓ Upserted. Total vectors: {self.index.ntotal}")
             return valid_ids
             
         except Exception as e:
-            logger.error(f"Error upserting vectors: {str(e)}")
-            raise HTTPException(status_code=500, detail=f"Failed to upsert vectors: {str(e)}")
- 
-    def search(self, query: str, language: str, top_k: int = 5, threshold: float = 0.5) -> List[Dict]:
+            logger.error(f"❌ Upsert error: {e}")
+            raise HTTPException(status_code=500, detail=f"Upsert failed: {str(e)}")
+
+    def hybrid_search(self, query: str, language: str, top_k: int = 5, threshold: float = MIN_SCORE_THRESHOLD) -> List[Dict]:
+        """
+        Hybrid search: Semantic + Keyword + Re-ranking (if available)
+        """
         try:
-            logger.info(f"[Search] Query='{query[:30]}...', Language={language}, TopK={top_k}, Threshold={threshold}")
+            logger.info(f"🔍 [Hybrid] Query='{query[:50]}...', Lang={language}, K={top_k}, Threshold={threshold}")
             
             if self.index.ntotal == 0:
-                logger.warning("[Search] Empty FAISS index")
+                logger.warning("⚠ Empty index")
                 return []
             
+            # Step 1: Generate embedding
             query_embedding = self.generate_embedding(query)
-            query_embedding = np.array([query_embedding], dtype=np.float32)
+            query_vec = np.array([query_embedding], dtype=np.float32)
+            faiss.normalize_L2(query_vec)
             
-            logger.info(f"Query embedding shape: {query_embedding.shape}")
-            logger.info(f"Index has {self.index.ntotal} vectors")
+            # Step 2: Vector search (get more for re-ranking)
+            retrieve_k = min(top_k * 3, self.index.ntotal)
+            distances, indices = self.index.search(query_vec, retrieve_k)
             
-            distances, indices = self.index.search(query_embedding, min(top_k, self.index.ntotal))
-            logger.info(f"Raw search results - distances: {distances[0].tolist()}, indices: {indices[0].tolist()}")
-            
+            # Step 3: Hybrid scoring
             results = []
-            debug_info = []
-            for i, (dist, idx) in enumerate(zip(distances[0], indices[0])):
-                debug_entry = {'index': int(idx), 'distance': float(dist)}
-                
-                vector_id = f"content_{idx}"
-                if vector_id not in self.id_to_index:
-                    debug_entry['status'] = 'skipped'
-                    debug_entry['reason'] = f'Vector ID {vector_id} not in id_to_index'
-                    debug_info.append(debug_entry)
-                    logger.debug(f"[Search] Vector ID {vector_id} not found in id_to_index, skipping")
-                    continue
-                
-                doc_idx = self.id_to_index[vector_id]
-                if doc_idx >= len(self.documents):
-                    debug_entry['status'] = 'skipped'
-                    debug_entry['reason'] = f'Invalid document index {doc_idx} for vector_id {vector_id}'
-                    debug_info.append(debug_entry)
-                    logger.debug(f"[Search] Invalid document index {doc_idx} for vector_id {vector_id}, skipping")
-                    continue
-                
-                score = max(0, 1 - (dist / 2))
-                debug_entry['score'] = score
-                
-                if score < threshold:
-                    debug_entry['status'] = 'skipped'
-                    debug_entry['reason'] = f'Low score: {score:.4f} < {threshold}'
-                    debug_info.append(debug_entry)
-                    logger.debug(f"[Search] Skipped vector_id {vector_id} due to low score: {score:.4f}")
-                    continue
-                
-                doc_metadata = self.documents[doc_idx]
-                doc_language = doc_metadata.get('language', 'vi')
-                language_bonus = 0.2 if doc_language == language else 0
-                final_score = score + language_bonus
-                
-                query_words = set(query.lower().split())
-                content_words = set(doc_metadata.get('content', '').lower().split())
-                common_words = query_words.intersection(content_words)
-                keyword_score = len(common_words) / max(len(query_words), 1)
-                
-                debug_entry['keyword_score'] = keyword_score
-                debug_entry['common_words'] = list(common_words)
-                debug_entry['content'] = doc_metadata.get('content', '')[:50] + '...'
-                debug_entry['language_match'] = doc_language == language
-                debug_entry['vector_id'] = vector_id
-                
-                if keyword_score < 0.1:
-                    debug_entry['status'] = 'skipped'
-                    debug_entry['reason'] = f'Low keyword overlap: {keyword_score:.2f} < 0.1'
-                    debug_info.append(debug_entry)
-                    logger.debug(f"[Skip] Low keyword overlap for '{doc_metadata.get('content', '')[:30]}...' (Keyword score: {keyword_score:.2f})")
-                    continue
-                
-                debug_entry['status'] = 'included'
-                debug_entry['final_score'] = final_score
-                debug_info.append(debug_entry)
-                
-                logger.debug(f"[Result] vector_id={vector_id}, score={score:.4f}, final_score={final_score:.4f}, lang_match={doc_language == language}, keyword_score={keyword_score:.2f}")
-                
-                result = {
-                    'vector_id': vector_id,
-                    'content': doc_metadata.get('content', ''),
-                    'score': final_score,
-                    'metadata': doc_metadata,
-                    'original_score': score,
-                    'language_match': doc_language == language,
-                    'keyword_score': keyword_score
-                }
-                results.append(result)
+            query_terms = set(query.lower().split())
             
-            logger.info(f"[Search] Debug info: {json.dumps(debug_info, ensure_ascii=False)}")
-            results.sort(key=lambda x: x['score'], reverse=True)
-            logger.info(f"[Search] Returned {len(results)} results after filtering")
-            return results[:top_k]
+            for dist, idx in zip(distances[0], indices[0]):
+                if idx >= len(self.documents):
+                    continue
+                
+                doc = self.documents[idx]
+                content = doc.get('content', '')
+                doc_lang = doc.get('language', 'vi')
+                
+                # Semantic score
+                semantic_score = float(dist)
+                
+                # Keyword score (simple BM25-like)
+                content_terms = set(content.lower().split())
+                common = query_terms.intersection(content_terms)
+                keyword_score = len(common) / max(len(query_terms), 1)
+                
+                # Language bonus
+                lang_bonus = 0.15 if doc_lang == language else 0
+                
+                # Hybrid score
+                hybrid_score = (0.7 * semantic_score) + (0.3 * keyword_score) + lang_bonus
+                
+                if hybrid_score >= threshold:
+                    results.append({
+                        'vector_id': doc.get('vector_id', f"content_{idx}"),
+                        'content': content,
+                        'score': hybrid_score,
+                        'semantic_score': semantic_score,
+                        'keyword_score': keyword_score,
+                        'metadata': doc,
+                        'language_match': doc_lang == language
+                    })
+            
+            # Step 4: Re-ranking with cross-encoder (if available)
+            if cross_encoder and len(results) > 1:
+                try:
+                    pairs = [[query, r['content'][:512]] for r in results]  # Limit length to avoid OOM
+                    rerank_scores = cross_encoder.predict(pairs)
+                    
+                    for i, score in enumerate(rerank_scores):
+                        results[i]['rerank_score'] = float(score)
+                        # Combine: 60% hybrid + 40% rerank
+                        results[i]['final_score'] = (0.5 * results[i]['score']) + (0.4 * float(score))
+                    
+                    results.sort(key=lambda x: x.get('final_score', x['score']), reverse=True)
+                    logger.info(f"✓ Re-ranked {len(results)} results")
+                except Exception as e:
+                    logger.warning(f"⚠ Re-ranking failed: {e}, using hybrid scores")
+                    results.sort(key=lambda x: x['score'], reverse=True)
+            else:
+                results.sort(key=lambda x: x['score'], reverse=True)
+            
+            final_results = results[:top_k]
+            logger.info(f"✓ [Hybrid] Returned {len(final_results)} results")
+            return final_results
             
         except Exception as e:
-            logger.exception(f"[Search] Error: {e}")
+            logger.error(f"❌ Hybrid search error: {e}")
             return []
- 
-    def vector_search(self, vector: List[float], language: str, top_k: int = 5, threshold: float = 0.5) -> List[Dict]:
+
+    def vector_search(self, vector: List[float], language: str, top_k: int = 5, threshold: float = MIN_SCORE_THRESHOLD) -> List[Dict]:
+        """Direct vector search (legacy support)"""
         try:
-            logger.info(f"Vector search with vector length: {len(vector)} (language: {language}, threshold: {threshold})")
-            
             if self.index.ntotal == 0:
-                logger.info("No vectors in index")
                 return []
             
             if len(vector) != self.dimension:
-                raise ValueError(f"Invalid vector dimension: expected {self.dimension}, got {len(vector)}")
+                raise ValueError(f"Invalid dimension: {len(vector)} (expected {self.dimension})")
             
-            # Normalize query vector
-            query_embedding = np.array([vector], dtype=np.float32)
-            faiss.normalize_L2(query_embedding)
+            query_vec = np.array([vector], dtype=np.float32)
+            faiss.normalize_L2(query_vec)
             
-            # Tăng nprobe để cải thiện độ chính xác/tốc độ
-            if hasattr(self.index, 'nprobe'):
-                self.index.nprobe = 10  # Tăng nprobe để search nhanh hơn
-            
-            distances, indices = self.index.search(query_embedding, min(top_k, self.index.ntotal))
-            logger.info(f"Raw vector search results - distances: {distances[0].tolist()}, indices: {indices[0].tolist()}")
+            distances, indices = self.index.search(query_vec, min(top_k, self.index.ntotal))
             
             results = []
-            debug_info = []
-            max_score = max(distances[0]) if len(distances[0]) > 0 else 0  # Để threshold động
-            dynamic_threshold = max(threshold, max_score * 0.8)  # Threshold động dựa trên max score
+            for dist, idx in zip(distances[0], indices[0]):
+                if idx >= len(self.documents):
+                    continue
+                
+                score = float(dist)
+                if score < threshold:
+                    continue
+                
+                doc = self.documents[idx]
+                doc_lang = doc.get('language', 'vi')
+                lang_bonus = 0.2 if doc_lang == language else 0
+                
+                results.append({
+                    'vector_id': doc.get('vector_id', f"content_{idx}"),
+                    'content': doc.get('content', ''),
+                    'score': score + lang_bonus,
+                    'metadata': doc,
+                    'language_match': doc_lang == language
+                })
             
-            for i, (dist, idx) in enumerate(zip(distances[0], indices[0])):
-                debug_entry = {'index': int(idx), 'distance': float(dist)}
-                
-                vector_id = f"content_{idx}"
-                if vector_id not in self.id_to_index:
-                    debug_entry['status'] = 'skipped'
-                    debug_entry['reason'] = f'Vector ID {vector_id} not in id_to_index'
-                    debug_info.append(debug_entry)
-                    logger.debug(f"[Vector Search] Vector ID {vector_id} not found in id_to_index, skipping")
-                    continue
-                
-                doc_idx = self.id_to_index[vector_id]
-                if doc_idx >= len(self.documents):
-                    debug_entry['status'] = 'skipped'
-                    debug_entry['reason'] = f'Invalid document index {doc_idx} for vector_id {vector_id}'
-                    debug_info.append(debug_entry)
-                    logger.debug(f"[Vector Search] Invalid document index {doc_idx} for vector_id {vector_id}, skipping")
-                    continue
-                
-                score = float(dist)  # Với IP, distance là cosine similarity trực tiếp (0-1)
-                debug_entry['score'] = score
-                
-                if score < dynamic_threshold:
-                    debug_entry['status'] = 'skipped'
-                    debug_entry['reason'] = f'Low score: {score:.4f} < {dynamic_threshold}'
-                    debug_info.append(debug_entry)
-                    logger.debug(f"[Vector Search] Skipped vector_id {vector_id} due to low score: {score:.4f}")
-                    continue
-                
-                doc_metadata = self.documents[doc_idx]
-                doc_language = doc_metadata.get('language', 'vi')
-                language_bonus = 0.2 if doc_language == language else 0.05  # Bonus thấp hơn nếu khác ngôn ngữ
-                keyword_boost = 0.1 if any(word in doc_metadata.get('content', '').lower() for word in language.split()) else 0  # Boost keyword đơn giản
-                final_score = score + language_bonus + keyword_boost
-                
-                debug_entry['status'] = 'included'
-                debug_entry['final_score'] = final_score
-                debug_entry['content'] = doc_metadata.get('content', '')[:50] + '...'
-                debug_entry['language_match'] = doc_language == language
-                debug_entry['vector_id'] = vector_id
-                debug_info.append(debug_entry)
-                
-                result = {
-                    'vector_id': vector_id,
-                    'content': doc_metadata.get('content', ''),
-                    'score': final_score,
-                    'metadata': doc_metadata,
-                    'language_match': doc_language == language
-                }
-                results.append(result)
-            
-            logger.info(f"[Vector Search] Debug info: {json.dumps(debug_info, ensure_ascii=False)}")
             results.sort(key=lambda x: x['score'], reverse=True)
-            logger.info(f"Vector search returned {len(results)} results")
+            logger.info(f"✓ [Vector] Returned {len(results)} results")
             return results[:top_k]
             
         except Exception as e:
-            logger.error(f"Error searching vectors by vector: {e}")
+            logger.error(f"❌ Vector search error: {e}")
             return []
- 
-    def debug_search(self, query: str, language: str, top_k: int = 5) -> List[Dict]:
-        try:
-            logger.info(f"[Debug Search] Query='{query[:30]}...', Language={language}, TopK={top_k}")
-            
-            if self.index.ntotal == 0:
-                logger.warning("[Debug Search] Empty FAISS index")
-                return []
-            
-            query_embedding = self.generate_embedding(query)
-            query_embedding = np.array([query_embedding], dtype=np.float32)
-            
-            logger.info(f"Query embedding shape: {query_embedding.shape}")
-            logger.info(f"Index has {self.index.ntotal} vectors")
-            
-            distances, indices = self.index.search(query_embedding, min(top_k, self.index.ntotal))
-            logger.info(f"Raw debug search results - distances: {distances[0].tolist()}, indices: {indices[0].tolist()}")
-            
-            debug_info = []
-            for i, (dist, idx) in enumerate(zip(distances[0], indices[0])):
-                debug_entry = {'index': int(idx), 'distance': float(dist)}
-                
-                vector_id = f"content_{idx}"
-                if vector_id not in self.id_to_index:
-                    debug_entry['status'] = 'skipped'
-                    debug_entry['reason'] = f'Vector ID {vector_id} not in id_to_index'
-                    debug_info.append(debug_entry)
-                    continue
-                
-                doc_idx = self.id_to_index[vector_id]
-                if doc_idx >= len(self.documents):
-                    debug_entry['status'] = 'skipped'
-                    debug_entry['reason'] = f'Invalid document index {doc_idx} for vector_id {vector_id}'
-                    debug_info.append(debug_entry)
-                    continue
-                
-                score = max(0, 1 - (dist / 2))
-                debug_entry['score'] = score
-                
-                doc_metadata = self.documents[doc_idx]
-                doc_language = doc_metadata.get('language', 'vi')
-                language_bonus = 0.2 if doc_language == language else 0
-                final_score = score + language_bonus
-                
-                query_words = set(query.lower().split())
-                content_words = set(doc_metadata.get('content', '').lower().split())
-                common_words = query_words.intersection(content_words)
-                keyword_score = len(common_words) / max(len(query_words), 1)
-                
-                debug_entry['keyword_score'] = keyword_score
-                debug_entry['common_words'] = list(common_words)
-                debug_entry['content'] = doc_metadata.get('content', '')[:50] + '...'
-                debug_entry['language_match'] = doc_language == language
-                debug_entry['final_score'] = final_score
-                debug_entry['vector_id'] = vector_id
-                debug_entry['metadata'] = doc_metadata
-                debug_info.append(debug_entry)
-            
-            logger.info(f"[Debug Search] Debug info: {json.dumps(debug_info, ensure_ascii=False)}")
-            return debug_info
-            
-        except Exception as e:
-            logger.exception(f"[Debug Search] Error: {e}")
-            return []
- 
+
     def delete_vectors(self, ids: List[str]) -> List[bool]:
+        """Delete vectors (rebuild approach with regeneration fallback)"""
         try:
-            logger.info(f"Deleting vectors: {ids}")
+            logger.info(f"🗑️ Deleting {len(ids)} vectors")
             
-            id_nums = []
-            valid_ids = []
-            for vector_id in ids:
-                try:
-                    id_num = int(vector_id.replace('content_', ''))
-                    id_nums.append(id_num)
-                    valid_ids.append(vector_id)
-                except ValueError:
-                    logger.warning(f"Invalid vector ID format: {vector_id}, skipping")
-                    continue
-            
-            if not id_nums:
-                logger.info("No valid IDs to delete")
-                return [False] * len(ids)
-            
-            id_selector = np.array(id_nums, dtype=np.int64)
-            removed = self.index.remove_ids(id_selector)
-            logger.info(f"Removed {removed} vectors from index")
-            
-            new_documents = []
-            results = [False] * len(ids)
+            delete_mask = [False] * len(self.documents)
             for i, doc in enumerate(self.documents):
-                vector_id = doc.get('vector_id', f"content_{i}")
-                if vector_id not in valid_ids:
-                    new_documents.append(doc)
-                else:
-                    idx = valid_ids.index(vector_id)
-                    results[idx] = True
-                    logger.debug(f"Marked vector {vector_id} for deletion")
+                vid = doc.get('vector_id', f"content_{i}")
+                if vid in ids:
+                    delete_mask[i] = True
             
-            self.documents = new_documents
+            # Collect kept docs and regenerate vectors for them
+            kept_docs = [doc for i, doc in enumerate(self.documents) if not delete_mask[i]]
+            results = [vid in ids for vid in [doc.get('vector_id', f"content_{i}") for i, doc in enumerate(self.documents)]]
+            
+            if len(kept_docs) == 0:
+                # Clear all
+                self.clear_index()
+                logger.info("✓ Cleared entire index")
+                return results[:len(ids)]  # Partial match
+            
+            # Regenerate embeddings for kept docs (expensive, but accurate)
+            new_embeddings = []
+            for doc in kept_docs:
+                try:
+                    content = doc.get('content', '')
+                    if content:
+                        emb = self.generate_embedding(content)
+                        new_embeddings.append(emb)
+                    else:
+                        logger.warning(f"⚠ Skip regen for doc without content: {doc.get('vector_id')}")
+                        new_embeddings.append(np.zeros(self.dimension, dtype=np.float32))  # Fallback zero vec
+                except Exception as e:
+                    logger.warning(f"⚠ Regen failed for {doc.get('vector_id')}: {e}")
+                    new_embeddings.append(np.zeros(self.dimension, dtype=np.float32))
+            
+            # Rebuild index
+            embeddings_array = np.array(new_embeddings, dtype=np.float32)
+            faiss.normalize_L2(embeddings_array)
+            self.index = faiss.IndexFlatIP(self.dimension)
+            self.index.add(embeddings_array)
+            self.documents = kept_docs
             self.id_to_index = {doc.get('vector_id', f"content_{i}"): i for i, doc in enumerate(self.documents)}
             
             faiss.write_index(self.index, self.index_path)
             self._save_metadata()
             
-            logger.info(f"Vectors deleted successfully. Remaining: {self.index.ntotal}, id_to_index: {self.id_to_index}")
+            logger.info(f"✓ Deleted. Remaining: {len(self.documents)} vectors")
             return results
             
         except Exception as e:
-            logger.error(f"Error deleting vectors: {str(e)}")
-            raise HTTPException(status_code=500, detail=f"Failed to delete vectors: {str(e)}")
- 
-    def clear_index(self):
+            logger.error(f"❌ Delete error: {e}")
+            raise HTTPException(status_code=500, detail=f"Delete failed: {str(e)}")
+
+    def clear_index(self) -> bool:
         try:
-            logger.info("Clearing FAISS index and metadata")
-            self.index = faiss.IndexIDMap(faiss.IndexFlatL2(self.dimension))
+            self.index = faiss.IndexFlatIP(self.dimension)
             self.documents = []
             self.id_to_index = {}
             
             if os.path.exists(self.index_path):
                 os.remove(self.index_path)
-                logger.info(f"Deleted FAISS index file: {self.index_path}")
             if os.path.exists(self.metadata_path):
                 os.remove(self.metadata_path)
-                logger.info(f"Deleted metadata file: {self.metadata_path}")
-                
+            
+            logger.info("✓ Index cleared completely")
             return True
         except Exception as e:
-            logger.error(f"Error clearing FAISS index: {str(e)}")
-            raise HTTPException(status_code=500, detail=f"Failed to clear index: {str(e)}")
- 
-# FastAPI app
-app = FastAPI()
+            logger.error(f"❌ Clear error: {e}")
+            raise HTTPException(status_code=500, detail=f"Clear failed: {str(e)}")
+
+# ==================== FASTAPI APP ====================
+app = FastAPI(title="Enhanced FAISS RAG Service", version="2.0")
 faiss_service = FAISSService()
- 
+chunker = SmartChunker()
+
+@app.post("/chunk_text")
+async def chunk_text(request: ChunkRequest):
+    """Smart text chunking"""
+    try:
+        chunks = chunker.chunk_text(
+            request.text,
+            request.language,
+            request.max_chunk_length,
+            request.min_chunk_length
+        )
+        return {
+            "success": True,
+            "chunks": chunks,
+            "chunk_count": len(chunks)
+        }
+    except Exception as e:
+        logger.error(f"❌ Chunking failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Chunking failed: {str(e)}")
+
 @app.post("/generate_embedding")
 async def generate_embedding(request: EmbeddingRequest):
     try:
         embedding = faiss_service.generate_embedding(request.text)
         return {"success": True, "embedding": embedding}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to generate embedding: {str(e)}")
- 
+        logger.error(f"❌ Embedding generation failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.post("/upsert")
 async def upsert_vectors(vectors: List[VectorData]):
-    ids = faiss_service.upsert_vectors(vectors)
-    if not ids:
-        raise HTTPException(status_code=500, detail="Failed to upsert vectors")
-    return {"success": True, "ids": ids}
- 
+    try:
+        ids = faiss_service.upsert_vectors(vectors)
+        return {"success": True, "ids": ids}
+    except Exception as e:
+        logger.error(f"❌ Upsert failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.post("/delete")
 async def delete_vectors(request: DeleteRequest):
-    results = faiss_service.delete_vectors(request.ids)
-    if not results:
-        raise HTTPException(status_code=500, detail="No vectors processed")
-    return {"success": True, "results": results}
- 
+    try:
+        results = faiss_service.delete_vectors(request.ids)
+        return {"success": True, "results": results}
+    except Exception as e:
+        logger.error(f"❌ Delete failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.post("/search")
 async def search_vectors(request: SearchRequest):
-    results = faiss_service.search(request.query, request.language, request.top_k, request.threshold)
-    return {"success": True, "results": results}
- 
+    """Hybrid search (recommended)"""
+    try:
+        results = faiss_service.hybrid_search(
+            request.query,
+            request.language,
+            request.top_k,
+            request.threshold
+        )
+        return {"success": True, "results": results}
+    except Exception as e:
+        logger.error(f"❌ Search failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.post("/vector_search")
 async def vector_search_vectors(request: VectorSearchRequest):
-    results = faiss_service.vector_search(request.vector, request.language, request.top_k, request.threshold)
-    return {"success": True, "results": results}
- 
-@app.post("/debug_search")
-async def debug_search_vectors(request: SearchRequest):
-    results = faiss_service.debug_search(request.query, request.language, request.top_k)
-    return {"success": True, "results": results}
- 
+    """Legacy vector search"""
+    try:
+        results = faiss_service.vector_search(
+            request.vector,
+            request.language,
+            request.top_k,
+            request.threshold
+        )
+        return {"success": True, "results": results}
+    except Exception as e:
+        logger.error(f"❌ Vector search failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.post("/clear_index")
 async def clear_index():
     try:
         faiss_service.clear_index()
         return {"success": True}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to clear index: {str(e)}")
- 
+        logger.error(f"❌ Clear index failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.get("/health")
 async def health_check():
     return {
         "status": "healthy",
         "total_vectors": faiss_service.index.ntotal,
         "total_metadata": len(faiss_service.documents),
-        "id_to_index": faiss_service.id_to_index
+        "cross_encoder_available": cross_encoder is not None,
+        "langdetect_available": LANGDETECT_AVAILABLE,
+        "embedding_model": EMBEDDING_MODEL,
+        "min_threshold": MIN_SCORE_THRESHOLD
     }
- 
-@app.get("/list_vectors")
-async def list_vectors():
-    try:
-        vectors = [
-            {"vector_id": doc.get("vector_id", f"content_{i}"), "metadata": doc}
-            for i, doc in enumerate(faiss_service.documents)
+
+@app.get("/")
+async def root():
+    return {
+        "service": "Enhanced FAISS RAG Service",
+        "version": "2.0",
+        "features": [
+            "Smart chunking (language-aware)",
+            "Hybrid search (semantic + keyword)",
+            "Cross-encoder re-ranking" if cross_encoder else "Basic hybrid search",
+            "Multi-language support (vi, en, ja, zh, ko)",
+            "Configurable via .env (model, threshold)"
         ]
-        return {"success": True, "vectors": vectors, "id_to_index": faiss_service.id_to_index}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to list vectors: {str(e)}")
- 
- 
- 
-# if __name__ == "__main__":
-#     import uvicorn
-#     uvicorn.run(app, host="0.0.0.0", port=8001)
+    }

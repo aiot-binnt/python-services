@@ -19,8 +19,10 @@ RUN pip install --upgrade pip setuptools wheel && \
         openai==2.2.0 \
         fastapi==0.115.0 \
         uvicorn==0.30.6 \
+        pydantic==2.9.2 \
         python-dotenv==1.0.1 \
-        packaging==25.0
+        packaging==25.0 \
+        langdetect==1.0.9
 
 
 COPY . .

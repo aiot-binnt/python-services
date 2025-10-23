@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Path
 import faiss
 import numpy as np
 import os
@@ -6,10 +6,11 @@ from pydantic import BaseModel
 from typing import List, Dict, Optional
 import logging
 import json
-from openai import OpenAI
+from openai import OpenAI, APIError, BadRequestError, RateLimitError
 from dotenv import load_dotenv
 import math
 import re
+import shutil
 
 # Setting logging
 logging.basicConfig(level=logging.INFO)
@@ -71,146 +72,55 @@ class DeleteRequest(BaseModel):
 class EmbeddingRequest(BaseModel):
     text: str
 
-class ChunkRequest(BaseModel):
-    text: str
-    language: str
-    max_chunk_length: int = 1000
-    min_chunk_length: int = 20
+# ==================== EMBEDDING FUNCTION (GLOBAL, NO BOT_ID NEEDED) ====================
+def generate_embedding(text: str) -> List[float]:
+    try:
+        if not text or not text.strip():
+            raise ValueError("Empty text")
 
-# ==================== SMART CHUNKER ====================
-class SmartChunker:
-    """Improved text chunking với language-aware rules"""
-    
-    LANGUAGE_RULES = {
-        'vi': {
-            'sentence_delimiters': r'(?<=[.!?])\s+',
-            'paragraph_delimiters': r'\n{2,}',
-        },
-        'en': {
-            'sentence_delimiters': r'(?<=[.!?])\s+',
-            'paragraph_delimiters': r'\n{2,}',
-        },
-        'ja': {
-            'sentence_delimiters': r'(?<=[。！？])\s*',
-            'paragraph_delimiters': r'\n{1,}',
-        },
-        'zh': {
-            'sentence_delimiters': r'(?<=[。！？])\s*',
-            'paragraph_delimiters': r'\n{1,}',
-        },
-        'ko': {
-            'sentence_delimiters': r'(?<=[.!?])\s*',
-            'paragraph_delimiters': r'\n{1,}',
-        }
-    }
-    
-    @classmethod
-    def is_char_based(cls, language: str) -> bool:
-        return language in ['ja', 'zh', 'ko']
-    
-    @classmethod
-    def calculate_length(cls, text: str, language: str) -> int:
-        if cls.is_char_based(language):
-            return len(text)
-        return len(text.split())
-    
-    @classmethod
-    def is_special_structure(cls, text: str) -> bool:
-        """Check if text is title, list, or table"""
-        text = text.strip()
-        # Check for lists
-        if re.match(r'^\s*[-•○●]\s+', text) or re.match(r'^\s*\d+\.\s+', text):
-            return True
-        # Check for tables
-        if '|' in text or text.count('\t') > 2:
-            return True
-        # Check for headers
-        if re.match(r'^#+\s+', text) or re.match(r'^[A-Z][A-Z\s]+:?$', text):
-            return True
-        return False
-    
-    @classmethod
-    def chunk_text(cls, text: str, language: str, max_length: int = 1000, min_length: int = 20) -> List[str]:
-        """
-        Smart chunking với semantic awareness
-        """
-        rules = cls.LANGUAGE_RULES.get(language, cls.LANGUAGE_RULES['en'])
-        
-        # Split into paragraphs
-        paragraphs = re.split(rules['paragraph_delimiters'], text.strip())
-        chunks = []
-        current_chunk = ""
-        current_length = 0
-        
-        for paragraph in paragraphs:
-            paragraph = paragraph.strip()
-            if not paragraph:
-                continue
-            
-            # Special structures as separate chunks
-            if cls.is_special_structure(paragraph):
-                if current_chunk and current_length >= min_length:
-                    chunks.append(current_chunk.strip())
-                    current_chunk = ""
-                    current_length = 0
-                chunks.append(paragraph)
-                continue
-            
-            para_length = cls.calculate_length(paragraph, language)
-            
-            # If paragraph fits
-            if para_length <= max_length:
-                if current_length + para_length <= max_length:
-                    current_chunk += ("\n\n" if current_chunk else "") + paragraph
-                    current_length += para_length
-                else:
-                    if current_chunk and current_length >= min_length:
-                        chunks.append(current_chunk.strip())
-                    current_chunk = paragraph
-                    current_length = para_length
-            else:
-                # Split into sentences
-                if current_chunk and current_length >= min_length:
-                    chunks.append(current_chunk.strip())
-                    current_chunk = ""
-                    current_length = 0
-                
-                sentences = re.split(rules['sentence_delimiters'], paragraph)
-                for sentence in sentences:
-                    sentence = sentence.strip()
-                    if not sentence:
-                        continue
-                    
-                    sent_length = cls.calculate_length(sentence, language)
-                    
-                    if current_length + sent_length <= max_length:
-                        current_chunk += (" " if current_chunk else "") + sentence
-                        current_length += sent_length
-                    else:
-                        if current_chunk and current_length >= min_length:
-                            chunks.append(current_chunk.strip())
-                        current_chunk = sentence
-                        current_length = sent_length
-        
-        # Add remaining
-        if current_chunk and current_length >= min_length:
-            chunks.append(current_chunk.strip())
-        
-        logger.info(f"✓ Chunked text: {len(chunks)} chunks (language: {language})")
-        return chunks
+        # FIX: Clean encoding & truncate to avoid OpenAI errors (max ~8000 chars for safety)
+        text = text.encode('utf-8', errors='ignore').decode('utf-8')  # Ignore bad chars like �
+        if len(text) > 8000:
+            text = text[:8000] + " [truncated]"
+            logger.warning("Text truncated to 8000 chars for embedding")
+
+        response = client.embeddings.create(
+            model=EMBEDDING_MODEL,  
+            input=text
+        )
+        embedding = response.data[0].embedding
+
+        logger.info(f"✓ Generated embedding for text preview: {text[:50]}...")
+        return embedding
+
+    except BadRequestError as e:  # FIX: Specific catch for invalid input (e.g., encoding/length)
+        logger.error(f"❌ BadRequest in embedding: {str(e)} | Text preview: {text[:100]}...")
+        raise HTTPException(status_code=400, detail=f"Invalid text for embedding: {str(e)}")
+    except RateLimitError as e:  # FIX: Rate limit
+        logger.error(f"❌ Rate limit in embedding: {str(e)}")
+        raise HTTPException(status_code=429, detail="Rate limit exceeded. Try again later.")
+    except APIError as e:  # FIX: General API error
+        logger.error(f"❌ OpenAI API error in embedding: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"OpenAI error: {str(e)}")
+    except Exception as e:
+        logger.error(f"❌ Unexpected error in embedding: {type(e).__name__}: {str(e)} | Text preview: {text[:100]}...")
+        raise HTTPException(status_code=500, detail=f"Embedding failed: {str(e)}")
 
 # ==================== FAISS SERVICE ====================
 class FAISSService:
-    def __init__(self, index_path: Optional[str] = None):
+    def __init__(self, bot_id: str, index_path: Optional[str] = None):
         self.dimension = 1536
+        self.bot_id = bot_id 
         if index_path is None:
-            index_path = os.path.join(os.path.dirname(__file__), "faiss_index")
+            base_path = os.path.join(os.path.dirname(__file__), "faiss_index")
+            bot_dir = os.path.join(base_path, bot_id) 
+            index_path = os.path.join(bot_dir, "index")
+            self.metadata_path = os.path.join(bot_dir, "metadata.json")  
         self.index_path = index_path
-        self.metadata_path = index_path + "_metadata.json"
         self.documents = []
         self.id_to_index = {}
-        logger.info(f"🔧 Initializing FAISS with index_path: {index_path}")
-        os.makedirs(os.path.dirname(index_path), exist_ok=True)
+        logger.info(f"🔧 Initializing FAISS for bot_id: {bot_id} at {index_path}")
+        os.makedirs(os.path.dirname(index_path), exist_ok=True) 
         
         self._load_index_and_metadata()
 
@@ -223,24 +133,24 @@ class FAISSService:
                 if os.path.exists(self.metadata_path):
                     with open(self.metadata_path, 'r', encoding='utf-8') as f:
                         self.documents = json.load(f)
-                    logger.info(f"✓ Loaded {len(self.documents)} documents metadata")
+                    logger.info(f"✓ Loaded {len(self.documents)} documents metadata for bot {self.bot_id}")
                     
                     self.id_to_index = {doc.get('vector_id', f"content_{i}"): i for i, doc in enumerate(self.documents)}
                     
                     if self.index.ntotal != len(self.documents):
-                        logger.warning(f"⚠ Index sync issue: {self.index.ntotal} vs {len(self.documents)}")
+                        logger.warning(f"⚠ Index sync issue for bot {self.bot_id}: {self.index.ntotal} vs {len(self.documents)}")
                         self._sync_index_and_metadata()
                 else:
                     self.documents = [{} for _ in range(self.index.ntotal)]
                     self.id_to_index = {f"content_{i}": i for i in range(self.index.ntotal)}
                     self._save_metadata()
             else:
-                logger.info("✓ Creating new FAISS index with Inner Product (cosine similarity)")
+                logger.info(f"✓ Creating new FAISS index for bot {self.bot_id} with Inner Product (cosine similarity)")
                 self.index = faiss.IndexFlatIP(self.dimension)
                 self.documents = []
                 self.id_to_index = {}
         except Exception as e:
-            logger.error(f"❌ Failed to load FAISS: {e}")
+            logger.error(f"❌ Failed to load FAISS for bot {self.bot_id}: {e}")
             self.index = faiss.IndexFlatIP(self.dimension)
             self.documents = []
             self.id_to_index = {}
@@ -257,33 +167,15 @@ class FAISSService:
         try:
             with open(self.metadata_path, 'w', encoding='utf-8') as f:
                 json.dump(self.documents, f, ensure_ascii=False, indent=2)
-            logger.info(f"✓ Saved metadata to {self.metadata_path}")
+            logger.info(f"✓ Saved metadata to {self.metadata_path} for bot {self.bot_id}")
         except Exception as e:
-            logger.error(f"❌ Failed to save metadata: {e}")
+            logger.error(f"❌ Failed to save metadata for bot {self.bot_id}: {e}")
 
-    def generate_embedding(self, text: str) -> List[float]:
-        try:
-            if not text or not text.strip():
-                raise ValueError("Empty text")
-
-            response = client.embeddings.create(
-                model=EMBEDDING_MODEL,  
-                input=text
-            )
-            embedding = response.data[0].embedding
-
-            if len(embedding) != self.dimension:
-                logger.warning(f"⚠ Dimension mismatch: {len(embedding)} (expected {self.dimension})")
-
-            return embedding
-
-        except Exception as e:
-            logger.error(f"❌ Failed to generate embedding: {e}")
-            raise HTTPException(status_code=500, detail=f"Embedding failed: {str(e)}")
+    # FIX: Remove generate_embedding from here, use global function
 
     def upsert_vectors(self, vectors: List[VectorData]) -> List[str]:
         try:
-            logger.info(f"📥 Upserting {len(vectors)} vectors")
+            logger.info(f"📥 Upserting {len(vectors)} vectors for bot {self.bot_id}")
             
             valid_vectors = []
             valid_metadatas = []
@@ -295,10 +187,14 @@ class FAISSService:
                     normalized = np.array([v.values], dtype=np.float32)
                     faiss.normalize_L2(normalized)
                     valid_vectors.append(normalized[0])
-                    valid_metadatas.append({**v.metadata, 'vector_id': v.id})
+                    # Enforce bot_id in metadata
+                    metadata = {**v.metadata}
+                    if 'bot_id' not in metadata:
+                        metadata['bot_id'] = self.bot_id
+                    valid_metadatas.append({**metadata, 'vector_id': v.id})
                     valid_ids.append(v.id)
                 else:
-                    logger.warning(f"⚠ Skip {v.id}: dimension {len(v.values)} (expected {self.dimension})")
+                    logger.warning(f"⚠ Skip {v.id} for bot {self.bot_id}: dimension {len(v.values)} (expected {self.dimension})")
             
             if not valid_vectors:
                 raise ValueError("No valid vectors")
@@ -317,11 +213,11 @@ class FAISSService:
             faiss.write_index(self.index, self.index_path)
             self._save_metadata()
             
-            logger.info(f"✓ Upserted. Total vectors: {self.index.ntotal}")
+            logger.info(f"✓ Upserted for bot {self.bot_id}. Total vectors: {self.index.ntotal}")
             return valid_ids
             
         except Exception as e:
-            logger.error(f"❌ Upsert error: {e}")
+            logger.error(f"❌ Upsert error for bot {self.bot_id}: {e}")
             raise HTTPException(status_code=500, detail=f"Upsert failed: {str(e)}")
 
     def hybrid_search(self, query: str, language: str, top_k: int = 5, threshold: float = MIN_SCORE_THRESHOLD) -> List[Dict]:
@@ -329,14 +225,14 @@ class FAISSService:
         Hybrid search: Semantic + Keyword + Re-ranking (if available)
         """
         try:
-            logger.info(f"🔍 [Hybrid] Query='{query[:50]}...', Lang={language}, K={top_k}, Threshold={threshold}")
+            logger.info(f"🔍 [Hybrid] Query='{query[:50]}...', Lang={language}, K={top_k}, Threshold={threshold}, Bot={self.bot_id}")
             
             if self.index.ntotal == 0:
-                logger.warning("⚠ Empty index")
+                logger.warning(f"⚠ Empty index for bot {self.bot_id}")
                 return []
             
-            # Step 1: Generate embedding
-            query_embedding = self.generate_embedding(query)
+            # Step 1: Generate embedding (use global function)
+            query_embedding = generate_embedding(query)  # FIX: Use global
             query_vec = np.array([query_embedding], dtype=np.float32)
             faiss.normalize_L2(query_vec)
             
@@ -353,8 +249,12 @@ class FAISSService:
                     continue
                 
                 doc = self.documents[idx]
+                # Filter theo bot_id
+                if doc.get('bot_id') != self.bot_id:
+                    continue
+                
                 content = doc.get('content', '')
-                doc_lang = doc.get('language', 'vi')
+                doc_languages = doc.get('languages', [language])  
                 
                 # Semantic score
                 semantic_score = float(dist)
@@ -364,8 +264,8 @@ class FAISSService:
                 common = query_terms.intersection(content_terms)
                 keyword_score = len(common) / max(len(query_terms), 1)
                 
-                # Language bonus
-                lang_bonus = 0.15 if doc_lang == language else 0
+                # Language bonus: Overlap với query lang
+                lang_bonus = 0.15 if language in doc_languages else 0.05  
                 
                 # Hybrid score
                 hybrid_score = (0.7 * semantic_score) + (0.3 * keyword_score) + lang_bonus
@@ -378,34 +278,33 @@ class FAISSService:
                         'semantic_score': semantic_score,
                         'keyword_score': keyword_score,
                         'metadata': doc,
-                        'language_match': doc_lang == language
+                        'language_match': language in doc_languages
                     })
             
             # Step 4: Re-ranking with cross-encoder (if available)
             if cross_encoder and len(results) > 1:
                 try:
-                    pairs = [[query, r['content'][:512]] for r in results]  # Limit length to avoid OOM
+                    pairs = [[query, r['content'][:512]] for r in results]  
                     rerank_scores = cross_encoder.predict(pairs)
                     
                     for i, score in enumerate(rerank_scores):
                         results[i]['rerank_score'] = float(score)
-                        # Combine: 60% hybrid + 40% rerank
                         results[i]['final_score'] = (0.5 * results[i]['score']) + (0.4 * float(score))
                     
                     results.sort(key=lambda x: x.get('final_score', x['score']), reverse=True)
-                    logger.info(f"✓ Re-ranked {len(results)} results")
+                    logger.info(f"✓ Re-ranked {len(results)} results for bot {self.bot_id}")
                 except Exception as e:
-                    logger.warning(f"⚠ Re-ranking failed: {e}, using hybrid scores")
+                    logger.warning(f"⚠ Re-ranking failed for bot {self.bot_id}: {e}, using hybrid scores")
                     results.sort(key=lambda x: x['score'], reverse=True)
             else:
                 results.sort(key=lambda x: x['score'], reverse=True)
             
             final_results = results[:top_k]
-            logger.info(f"✓ [Hybrid] Returned {len(final_results)} results")
+            logger.info(f"✓ [Hybrid] Returned {len(final_results)} results for bot {self.bot_id}")
             return final_results
             
         except Exception as e:
-            logger.error(f"❌ Hybrid search error: {e}")
+            logger.error(f"❌ Hybrid search error for bot {self.bot_id}: {e}")
             return []
 
     def vector_search(self, vector: List[float], language: str, top_k: int = 5, threshold: float = MIN_SCORE_THRESHOLD) -> List[Dict]:
@@ -427,11 +326,15 @@ class FAISSService:
                 if idx >= len(self.documents):
                     continue
                 
+                doc = self.documents[idx]
+                # Filter theo bot_id
+                if doc.get('bot_id') != self.bot_id:
+                    continue
+                
                 score = float(dist)
                 if score < threshold:
                     continue
                 
-                doc = self.documents[idx]
                 doc_lang = doc.get('language', 'vi')
                 lang_bonus = 0.2 if doc_lang == language else 0
                 
@@ -444,17 +347,17 @@ class FAISSService:
                 })
             
             results.sort(key=lambda x: x['score'], reverse=True)
-            logger.info(f"✓ [Vector] Returned {len(results)} results")
+            logger.info(f"✓ [Vector] Returned {len(results)} results for bot {self.bot_id}")
             return results[:top_k]
             
         except Exception as e:
-            logger.error(f"❌ Vector search error: {e}")
+            logger.error(f"❌ Vector search error for bot {self.bot_id}: {e}")
             return []
 
     def delete_vectors(self, ids: List[str]) -> List[bool]:
         """Delete vectors (rebuild approach with regeneration fallback)"""
         try:
-            logger.info(f"🗑️ Deleting {len(ids)} vectors")
+            logger.info(f"🗑️ Deleting {len(ids)} vectors for bot {self.bot_id}")
             
             delete_mask = [False] * len(self.documents)
             for i, doc in enumerate(self.documents):
@@ -467,24 +370,24 @@ class FAISSService:
             results = [vid in ids for vid in [doc.get('vector_id', f"content_{i}") for i, doc in enumerate(self.documents)]]
             
             if len(kept_docs) == 0:
-                # Clear all
+                # Clear all for this bot
                 self.clear_index()
-                logger.info("✓ Cleared entire index")
+                logger.info(f"✓ Cleared entire index for bot {self.bot_id}")
                 return results[:len(ids)]  # Partial match
             
-            # Regenerate embeddings for kept docs (expensive, but accurate)
+            # Regenerate embeddings for kept docs (expensive, but accurate - chỉ per bot)
             new_embeddings = []
             for doc in kept_docs:
                 try:
                     content = doc.get('content', '')
                     if content:
-                        emb = self.generate_embedding(content)
+                        emb = generate_embedding(content)  # FIX: Use global
                         new_embeddings.append(emb)
                     else:
-                        logger.warning(f"⚠ Skip regen for doc without content: {doc.get('vector_id')}")
+                        logger.warning(f"⚠ Skip regen for doc without content in bot {self.bot_id}: {doc.get('vector_id')}")
                         new_embeddings.append(np.zeros(self.dimension, dtype=np.float32))  # Fallback zero vec
                 except Exception as e:
-                    logger.warning(f"⚠ Regen failed for {doc.get('vector_id')}: {e}")
+                    logger.warning(f"⚠ Regen failed for {doc.get('vector_id')} in bot {self.bot_id}: {e}")
                     new_embeddings.append(np.zeros(self.dimension, dtype=np.float32))
             
             # Rebuild index
@@ -498,85 +401,70 @@ class FAISSService:
             faiss.write_index(self.index, self.index_path)
             self._save_metadata()
             
-            logger.info(f"✓ Deleted. Remaining: {len(self.documents)} vectors")
+            logger.info(f"✓ Deleted for bot {self.bot_id}. Remaining: {len(self.documents)} vectors")
             return results
             
         except Exception as e:
-            logger.error(f"❌ Delete error: {e}")
+            logger.error(f"❌ Delete error for bot {self.bot_id}: {e}")
             raise HTTPException(status_code=500, detail=f"Delete failed: {str(e)}")
 
     def clear_index(self) -> bool:
         try:
+            # Xóa toàn folder per-bot
+            bot_dir = os.path.dirname(self.index_path)
+            if os.path.exists(bot_dir):
+                shutil.rmtree(bot_dir)
+                logger.info(f"✓ Deleted bot folder: {bot_dir}")
+            
             self.index = faiss.IndexFlatIP(self.dimension)
             self.documents = []
             self.id_to_index = {}
             
-            if os.path.exists(self.index_path):
-                os.remove(self.index_path)
-            if os.path.exists(self.metadata_path):
-                os.remove(self.metadata_path)
-            
-            logger.info("✓ Index cleared completely")
+            logger.info(f"✓ Index cleared completely for bot {self.bot_id}")
             return True
         except Exception as e:
-            logger.error(f"❌ Clear error: {e}")
+            logger.error(f"❌ Clear error for bot {self.bot_id}: {e}")
             raise HTTPException(status_code=500, detail=f"Clear failed: {str(e)}")
 
 # ==================== FASTAPI APP ====================
 app = FastAPI(title="Enhanced FAISS RAG Service", version="2.0")
-faiss_service = FAISSService()
-chunker = SmartChunker()
-
-@app.post("/chunk_text")
-async def chunk_text(request: ChunkRequest):
-    """Smart text chunking"""
-    try:
-        chunks = chunker.chunk_text(
-            request.text,
-            request.language,
-            request.max_chunk_length,
-            request.min_chunk_length
-        )
-        return {
-            "success": True,
-            "chunks": chunks,
-            "chunk_count": len(chunks)
-        }
-    except Exception as e:
-        logger.error(f"❌ Chunking failed: {e}")
-        raise HTTPException(status_code=500, detail=f"Chunking failed: {str(e)}")
+# FIX: Xóa global faiss_service = FAISSService() – không cần nữa
 
 @app.post("/generate_embedding")
-async def generate_embedding(request: EmbeddingRequest):
+async def generate_embedding_endpoint(request: EmbeddingRequest):
     try:
-        embedding = faiss_service.generate_embedding(request.text)
+        embedding = generate_embedding(request.text)
         return {"success": True, "embedding": embedding}
+    except HTTPException:
+        raise  # Re-raise FastAPI exceptions
     except Exception as e:
-        logger.error(f"❌ Embedding generation failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"❌ Endpoint error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal embedding error")
 
-@app.post("/upsert")
-async def upsert_vectors(vectors: List[VectorData]):
+@app.post("/upsert/{bot_id}")
+async def upsert_vectors(bot_id: str, vectors: List[VectorData]):  # FIX: Order: path first (no default), then body
     try:
+        faiss_service = FAISSService(bot_id)
         ids = faiss_service.upsert_vectors(vectors)
         return {"success": True, "ids": ids}
     except Exception as e:
-        logger.error(f"❌ Upsert failed: {e}")
+        logger.error(f"❌ Upsert failed for bot {bot_id}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/delete")
-async def delete_vectors(request: DeleteRequest):
+@app.post("/delete/{bot_id}")
+async def delete_vectors(bot_id: str, request: DeleteRequest):  # FIX: Order
     try:
+        faiss_service = FAISSService(bot_id)
         results = faiss_service.delete_vectors(request.ids)
         return {"success": True, "results": results}
     except Exception as e:
-        logger.error(f"❌ Delete failed: {e}")
+        logger.error(f"❌ Delete failed for bot {bot_id}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/search")
-async def search_vectors(request: SearchRequest):
-    """Hybrid search (recommended)"""
+@app.post("/search/{bot_id}")
+async def search_vectors(bot_id: str, request: SearchRequest):  # FIX: Order
     try:
+        faiss_service = FAISSService(bot_id)
         results = faiss_service.hybrid_search(
             request.query,
             request.language,
@@ -585,13 +473,13 @@ async def search_vectors(request: SearchRequest):
         )
         return {"success": True, "results": results}
     except Exception as e:
-        logger.error(f"❌ Search failed: {e}")
+        logger.error(f"❌ Search failed for bot {bot_id}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/vector_search")
-async def vector_search_vectors(request: VectorSearchRequest):
-    """Legacy vector search"""
+@app.post("/vector_search/{bot_id}")
+async def vector_search_vectors(bot_id: str, request: VectorSearchRequest):  # FIX: Order
     try:
+        faiss_service = FAISSService(bot_id)
         results = faiss_service.vector_search(
             request.vector,
             request.language,
@@ -600,29 +488,37 @@ async def vector_search_vectors(request: VectorSearchRequest):
         )
         return {"success": True, "results": results}
     except Exception as e:
-        logger.error(f"❌ Vector search failed: {e}")
+        logger.error(f"❌ Vector search failed for bot {bot_id}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/clear_index")
-async def clear_index():
+@app.post("/clear_index/{bot_id}")
+async def clear_index(bot_id: str):  # No body, OK
     try:
-        faiss_service.clear_index()
-        return {"success": True}
+        faiss_service = FAISSService(bot_id)
+        success = faiss_service.clear_index()
+        return {"success": success}
     except Exception as e:
-        logger.error(f"❌ Clear index failed: {e}")
+        logger.error(f"❌ Clear index failed for bot {bot_id}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/health")
-async def health_check():
-    return {
-        "status": "healthy",
-        "total_vectors": faiss_service.index.ntotal,
-        "total_metadata": len(faiss_service.documents),
-        "cross_encoder_available": cross_encoder is not None,
-        "langdetect_available": LANGDETECT_AVAILABLE,
-        "embedding_model": EMBEDDING_MODEL,
-        "min_threshold": MIN_SCORE_THRESHOLD
-    }
+# FIX: /health/{bot_id} để per-bot
+@app.get("/health/{bot_id}")
+async def health_check(bot_id: str = Path(..., description="Bot ID")):
+    try:
+        faiss_service = FAISSService(bot_id)
+        return {
+            "status": "healthy",
+            "bot_id": bot_id,
+            "total_vectors": faiss_service.index.ntotal,
+            "total_metadata": len(faiss_service.documents),
+            "cross_encoder_available": cross_encoder is not None,
+            "langdetect_available": LANGDETECT_AVAILABLE,
+            "embedding_model": EMBEDDING_MODEL,
+            "min_threshold": MIN_SCORE_THRESHOLD
+        }
+    except Exception as e:
+        logger.error(f"❌ Health check failed for bot {bot_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/")
 async def root():
@@ -630,10 +526,10 @@ async def root():
         "service": "Enhanced FAISS RAG Service",
         "version": "2.0",
         "features": [
-            "Smart chunking (language-aware)",
             "Hybrid search (semantic + keyword)",
             "Cross-encoder re-ranking" if cross_encoder else "Basic hybrid search",
             "Multi-language support (vi, en, ja, zh, ko)",
-            "Configurable via .env (model, threshold)"
+            "Configurable via .env (model, threshold)",
+            "Per-bot isolation (faiss_index/{bot_id}/)"
         ]
     }

@@ -78,8 +78,8 @@ def generate_embedding(text: str) -> List[float]:
         if not text or not text.strip():
             raise ValueError("Empty text")
 
-        # FIX: Clean encoding & truncate to avoid OpenAI errors (max ~8000 chars for safety)
-        text = text.encode('utf-8', errors='ignore').decode('utf-8')  # Ignore bad chars like �
+
+        text = text.encode('utf-8', errors='ignore').decode('utf-8')  
         if len(text) > 8000:
             text = text[:8000] + " [truncated]"
             logger.warning("Text truncated to 8000 chars for embedding")
@@ -93,13 +93,13 @@ def generate_embedding(text: str) -> List[float]:
         logger.info(f"✓ Generated embedding for text preview: {text[:50]}...")
         return embedding
 
-    except BadRequestError as e:  # FIX: Specific catch for invalid input (e.g., encoding/length)
+    except BadRequestError as e:  
         logger.error(f"❌ BadRequest in embedding: {str(e)} | Text preview: {text[:100]}...")
         raise HTTPException(status_code=400, detail=f"Invalid text for embedding: {str(e)}")
-    except RateLimitError as e:  # FIX: Rate limit
+    except RateLimitError as e: 
         logger.error(f"❌ Rate limit in embedding: {str(e)}")
         raise HTTPException(status_code=429, detail="Rate limit exceeded. Try again later.")
-    except APIError as e:  # FIX: General API error
+    except APIError as e:  
         logger.error(f"❌ OpenAI API error in embedding: {str(e)}")
         raise HTTPException(status_code=500, detail=f"OpenAI error: {str(e)}")
     except Exception as e:
@@ -171,8 +171,6 @@ class FAISSService:
         except Exception as e:
             logger.error(f"❌ Failed to save metadata for bot {self.bot_id}: {e}")
 
-    # FIX: Remove generate_embedding from here, use global function
-
     def upsert_vectors(self, vectors: List[VectorData]) -> List[str]:
         try:
             logger.info(f"📥 Upserting {len(vectors)} vectors for bot {self.bot_id}")
@@ -232,7 +230,7 @@ class FAISSService:
                 return []
             
             # Step 1: Generate embedding (use global function)
-            query_embedding = generate_embedding(query)  # FIX: Use global
+            query_embedding = generate_embedding(query)  
             query_vec = np.array([query_embedding], dtype=np.float32)
             faiss.normalize_L2(query_vec)
             
@@ -249,7 +247,6 @@ class FAISSService:
                     continue
                 
                 doc = self.documents[idx]
-                # Filter theo bot_id
                 if doc.get('bot_id') != self.bot_id:
                     continue
                 
@@ -264,7 +261,6 @@ class FAISSService:
                 common = query_terms.intersection(content_terms)
                 keyword_score = len(common) / max(len(query_terms), 1)
                 
-                # Language bonus: Overlap với query lang
                 lang_bonus = 0.15 if language in doc_languages else 0.05  
                 
                 # Hybrid score
@@ -327,7 +323,6 @@ class FAISSService:
                     continue
                 
                 doc = self.documents[idx]
-                # Filter theo bot_id
                 if doc.get('bot_id') != self.bot_id:
                     continue
                 
@@ -375,17 +370,16 @@ class FAISSService:
                 logger.info(f"✓ Cleared entire index for bot {self.bot_id}")
                 return results[:len(ids)]  # Partial match
             
-            # Regenerate embeddings for kept docs (expensive, but accurate - chỉ per bot)
             new_embeddings = []
             for doc in kept_docs:
                 try:
                     content = doc.get('content', '')
                     if content:
-                        emb = generate_embedding(content)  # FIX: Use global
+                        emb = generate_embedding(content) 
                         new_embeddings.append(emb)
                     else:
                         logger.warning(f"⚠ Skip regen for doc without content in bot {self.bot_id}: {doc.get('vector_id')}")
-                        new_embeddings.append(np.zeros(self.dimension, dtype=np.float32))  # Fallback zero vec
+                        new_embeddings.append(np.zeros(self.dimension, dtype=np.float32)) 
                 except Exception as e:
                     logger.warning(f"⚠ Regen failed for {doc.get('vector_id')} in bot {self.bot_id}: {e}")
                     new_embeddings.append(np.zeros(self.dimension, dtype=np.float32))
@@ -410,7 +404,6 @@ class FAISSService:
 
     def clear_index(self) -> bool:
         try:
-            # Xóa toàn folder per-bot
             bot_dir = os.path.dirname(self.index_path)
             if os.path.exists(bot_dir):
                 shutil.rmtree(bot_dir)
@@ -428,7 +421,6 @@ class FAISSService:
 
 # ==================== FASTAPI APP ====================
 app = FastAPI(title="Enhanced FAISS RAG Service", version="2.0")
-# FIX: Xóa global faiss_service = FAISSService() – không cần nữa
 
 @app.post("/generate_embedding")
 async def generate_embedding_endpoint(request: EmbeddingRequest):
@@ -442,7 +434,7 @@ async def generate_embedding_endpoint(request: EmbeddingRequest):
         raise HTTPException(status_code=500, detail="Internal embedding error")
 
 @app.post("/upsert/{bot_id}")
-async def upsert_vectors(bot_id: str, vectors: List[VectorData]):  # FIX: Order: path first (no default), then body
+async def upsert_vectors(bot_id: str, vectors: List[VectorData]): 
     try:
         faiss_service = FAISSService(bot_id)
         ids = faiss_service.upsert_vectors(vectors)
@@ -452,7 +444,7 @@ async def upsert_vectors(bot_id: str, vectors: List[VectorData]):  # FIX: Order:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/delete/{bot_id}")
-async def delete_vectors(bot_id: str, request: DeleteRequest):  # FIX: Order
+async def delete_vectors(bot_id: str, request: DeleteRequest):  
     try:
         faiss_service = FAISSService(bot_id)
         results = faiss_service.delete_vectors(request.ids)
@@ -462,7 +454,7 @@ async def delete_vectors(bot_id: str, request: DeleteRequest):  # FIX: Order
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/search/{bot_id}")
-async def search_vectors(bot_id: str, request: SearchRequest):  # FIX: Order
+async def search_vectors(bot_id: str, request: SearchRequest): 
     try:
         faiss_service = FAISSService(bot_id)
         results = faiss_service.hybrid_search(
@@ -477,7 +469,7 @@ async def search_vectors(bot_id: str, request: SearchRequest):  # FIX: Order
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/vector_search/{bot_id}")
-async def vector_search_vectors(bot_id: str, request: VectorSearchRequest):  # FIX: Order
+async def vector_search_vectors(bot_id: str, request: VectorSearchRequest):  
     try:
         faiss_service = FAISSService(bot_id)
         results = faiss_service.vector_search(
@@ -492,7 +484,7 @@ async def vector_search_vectors(bot_id: str, request: VectorSearchRequest):  # F
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/clear_index/{bot_id}")
-async def clear_index(bot_id: str):  # No body, OK
+async def clear_index(bot_id: str): 
     try:
         faiss_service = FAISSService(bot_id)
         success = faiss_service.clear_index()
@@ -501,7 +493,7 @@ async def clear_index(bot_id: str):  # No body, OK
         logger.error(f"❌ Clear index failed for bot {bot_id}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-# FIX: /health/{bot_id} để per-bot
+
 @app.get("/health/{bot_id}")
 async def health_check(bot_id: str = Path(..., description="Bot ID")):
     try:

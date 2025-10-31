@@ -72,6 +72,14 @@ class DeleteRequest(BaseModel):
 class EmbeddingRequest(BaseModel):
     text: str
 
+class ChunkRequest(BaseModel):
+    text: str
+    language: str
+    max_chunk_length: int = 500
+    min_chunk_length: int = 200
+    overlap_ratio: float = 0.1
+
+
 # ==================== EMBEDDING FUNCTION (GLOBAL, NO BOT_ID NEEDED) ====================
 def generate_embedding(text: str) -> List[float]:
     try:
@@ -105,6 +113,252 @@ def generate_embedding(text: str) -> List[float]:
     except Exception as e:
         logger.error(f"❌ Unexpected error in embedding: {type(e).__name__}: {str(e)} | Text preview: {text[:100]}...")
         raise HTTPException(status_code=500, detail=f"Embedding failed: {str(e)}")
+
+# ==================== SMART CHUNKER ====================
+class SmartChunker:
+    """Improved text chunking with SENTENCE-BASED overlap (no more cut-off words!)"""
+    
+    LANGUAGE_RULES = {
+        'vi': {
+            'sentence_delimiters': r'(?<=[.!?])\s+',
+            'paragraph_delimiters': r'\n{2,}',
+            'cjk_delims': None
+        },
+        'en': {
+            'sentence_delimiters': r'(?<=[.!?])\s+',
+            'paragraph_delimiters': r'\n{2,}',
+            'cjk_delims': None
+        },
+        'ja': {
+            'sentence_delimiters': r'(?<=[。！？])\s*',
+            'paragraph_delimiters': r'\n{1,}',
+            'cjk_delims': r'[ \t\n\r\0\x0B。！？、；：（）「」『』]'
+        },
+        'zh': {
+            'sentence_delimiters': r'(?<=[。！？])\s*',
+            'paragraph_delimiters': r'\n{1,}',
+            'cjk_delims': r'[ \t\n\r\0\x0B。！？、；：（）「」『』]'
+        },
+        'ko': {
+            'sentence_delimiters': r'(?<=[.!?])\s*',
+            'paragraph_delimiters': r'\n{1,}',
+            'cjk_delims': r'[ \t\n\r\0\x0B。！？、；：（）「」『』]'
+        }
+    }
+    
+    @classmethod
+    def is_char_based(cls, language: str) -> bool:
+        return language in ['ja', 'zh', 'ko']
+    
+    @classmethod
+    def calculate_length(cls, text: str, language: str) -> int:
+        if cls.is_char_based(language):
+            return len(text)
+        return len(text.split())
+    
+    @classmethod
+    def is_special_structure(cls, text: str) -> bool:
+        """Enhanced: Detect multi-line tables/lists/headers"""
+        text = text.strip()
+        if re.match(r'^\s*[-•○●]\s+', text) or re.match(r'^\s*\d+\.\s+', text):
+            return True
+        if re.search(r'\|\s*\S', text) or text.count('\t') > 1:
+            return True
+        if re.match(r'^#+\s+', text) or re.match(r'^[A-Z][A-Z\s]+:?$', text):
+            return True
+        return False
+    
+    @classmethod
+    def _join_sentences(cls, sentences: List[str], is_char_based: bool) -> str:
+        """Join sentences with appropriate separator"""
+        if not sentences:
+            return ''
+        separator = '' if is_char_based else ' '
+        return separator.join(sentences)
+    
+    @classmethod
+    def _build_overlap(cls, prev_sentences: List[str], max_length: int, overlap_ratio: float, 
+                      language: str, is_char_based: bool) -> str:
+        """
+        Build overlap from COMPLETE SENTENCES (last N sentences that fit in overlap window)
+        
+        KEY IMPROVEMENT: Instead of cutting text at overlap_length characters,
+        we take the last N complete sentences whose total length <= overlap_ratio * max_length
+        
+        Example:
+        - prev_sentences = ["Sentence 1.", "Sentence 2 is long.", "Sentence 3."]
+        - overlap_ratio = 0.2, max_length = 500 => target = 100 words
+        - Result: Take "Sentence 3." (if < 100 words) or "Sentence 2 is long. Sentence 3."
+        """
+        if not prev_sentences:
+            return ''
+        
+        target_overlap_length = int(max_length * overlap_ratio)
+        overlap_sentences = []
+        overlap_length = 0
+        
+        # Iterate from end to beginning
+        for sent in reversed(prev_sentences):
+            sent_len = cls.calculate_length(sent, language)
+            
+            # If adding this sentence still fits => add it
+            if overlap_length + sent_len <= target_overlap_length:
+                overlap_sentences.insert(0, sent)  # Insert at beginning to preserve order
+                overlap_length += sent_len
+            else:
+                # If no sentences yet and this one is smaller than target => still take it
+                if not overlap_sentences and sent_len < target_overlap_length:
+                    overlap_sentences.insert(0, sent)
+                break
+        
+        return cls._join_sentences(overlap_sentences, is_char_based)
+    
+    @classmethod
+    def chunk_text(cls, text: str, language: str, max_length: int = 500, min_length: int = 20, overlap_ratio: float = 0.1) -> List[str]:
+        if language == 'mixed':
+            language = 'vi'
+        
+        rules = cls.LANGUAGE_RULES.get(language, cls.LANGUAGE_RULES['en'])
+        sentence_delims = rules['sentence_delimiters']
+        paragraph_delims = rules['paragraph_delimiters']
+        cjk_delims = rules['cjk_delims']
+        is_char_based = cls.is_char_based(language)
+        
+        paragraphs = re.split(paragraph_delims, text.strip(), flags=re.UNICODE | re.MULTILINE)
+        paragraphs = [p.strip() for p in paragraphs if p.strip()]
+        
+        chunks = []
+        prev_sentences = []  # KEY CHANGE: Store list of sentences instead of text chunk
+        overlap_count = 0
+        
+        for para in paragraphs:
+            if not para:
+                continue
+            
+            # === HANDLE SPECIAL STRUCTURES ===
+            if cls.is_special_structure(para):
+                para_len = cls.calculate_length(para, language)
+                if para_len >= min_length:
+                    # Add sentence-based overlap
+                    if prev_sentences:
+                        overlap_text = cls._build_overlap(prev_sentences, max_length, overlap_ratio, language, is_char_based)
+                        if overlap_text:
+                            para = overlap_text + '\n' + para
+                            overlap_count += 1
+                    chunks.append(para)
+                    prev_sentences = [para]  # Treat whole structure as one sentence
+                continue
+            
+            # === SMALL PARAGRAPH (fits in one chunk) ===
+            para_len = cls.calculate_length(para, language)
+            if para_len <= max_length:
+                if para_len >= min_length:
+                    # Add sentence-based overlap
+                    if prev_sentences:
+                        overlap_text = cls._build_overlap(prev_sentences, max_length, overlap_ratio, language, is_char_based)
+                        if overlap_text:
+                            para = overlap_text + (' ' if not is_char_based else '') + para
+                            overlap_count += 1
+                    chunks.append(para)
+                    # Split paragraph into sentences for next overlap
+                    para_sentences = re.split(sentence_delims, para, flags=re.UNICODE)
+                    prev_sentences = [s.strip() for s in para_sentences if s.strip()]
+                continue
+            
+            # === LARGE PARAGRAPH => Split into multiple chunks ===
+            sentences = re.split(sentence_delims, para, flags=re.UNICODE)
+            sentences = [s.strip() for s in sentences if s.strip()]
+            
+            current_chunk_sentences = []  # List of sentences for current chunk
+            current_len = 0
+            
+            for sent in sentences:
+                sent_len = cls.calculate_length(sent, language)
+                
+                # If adding this sentence still fits
+                if current_len + sent_len <= max_length:
+                    current_chunk_sentences.append(sent)
+                    current_len += sent_len
+                else:
+                    # Chunk is full => create new chunk
+                    if current_chunk_sentences and current_len >= min_length:
+                        chunk_text = cls._join_sentences(current_chunk_sentences, is_char_based)
+                        
+                        # Add sentence-based overlap from previous chunk
+                        if prev_sentences:
+                            overlap_text = cls._build_overlap(prev_sentences, max_length, overlap_ratio, language, is_char_based)
+                            if overlap_text:
+                                chunk_text = overlap_text + (' ' if not is_char_based else '') + chunk_text
+                                overlap_count += 1
+                        
+                        chunks.append(chunk_text)
+                        prev_sentences = current_chunk_sentences[:]  # Save sentences for next overlap
+                    
+                    # Start new chunk with current sentence
+                    current_chunk_sentences = [sent]
+                    current_len = sent_len
+            
+            # Handle last chunk of paragraph
+            if current_chunk_sentences and current_len >= min_length:
+                chunk_text = cls._join_sentences(current_chunk_sentences, is_char_based)
+                
+                if prev_sentences:
+                    overlap_text = cls._build_overlap(prev_sentences, max_length, overlap_ratio, language, is_char_based)
+                    if overlap_text:
+                        chunk_text = overlap_text + (' ' if not is_char_based else '') + chunk_text
+                        overlap_count += 1
+                
+                chunks.append(chunk_text)
+                prev_sentences = current_chunk_sentences[:]
+            
+            # === FALLBACK FOR CJK (if sentence splitting fails) ===
+            if is_char_based and cjk_delims and len(sentences) <= 1 and para_len > max_length:
+                rough_words = re.split(cjk_delims, para)
+                current_chunk_words = []
+                current_len = 0
+                
+                for word in rough_words:
+                    if word.strip():
+                        word_len = len(word.strip())
+                        if current_len + word_len <= max_length:
+                            current_chunk_words.append(word.strip())
+                            current_len += word_len
+                        else:
+                            if current_chunk_words and current_len >= min_length:
+                                chunk_text = ' '.join(current_chunk_words)
+                                
+                                if prev_sentences:
+                                    overlap_text = cls._build_overlap(prev_sentences, max_length, overlap_ratio, language, is_char_based)
+                                    if overlap_text:
+                                        chunk_text = overlap_text + chunk_text
+                                        overlap_count += 1
+                                
+                                chunks.append(chunk_text)
+                                prev_sentences = [chunk_text]
+                            
+                            current_chunk_words = [word.strip()]
+                            current_len = word_len
+                
+                if current_chunk_words and current_len >= min_length:
+                    chunk_text = ' '.join(current_chunk_words)
+                    
+                    if prev_sentences:
+                        overlap_text = cls._build_overlap(prev_sentences, max_length, overlap_ratio, language, is_char_based)
+                        if overlap_text:
+                            chunk_text = overlap_text + chunk_text
+                            overlap_count += 1
+                    
+                    chunks.append(chunk_text)
+                    prev_sentences = [chunk_text]
+        
+        # Cleanup
+        chunks = [c.strip() for c in chunks if cls.calculate_length(c, language) >= min_length]
+        chunks = list(dict.fromkeys(chunks))  # Dedup order-preserving
+        
+        avg_size = sum(cls.calculate_length(c, language) for c in chunks) / len(chunks) if chunks else 0
+        logger.info(f"✓ Chunked: {len(chunks)} chunks (lang: {language}, avg: {avg_size:.1f}, overlaps: {overlap_count})")
+        return chunks
+    
 
 # ==================== FAISS SERVICE ====================
 class FAISSService:
@@ -483,6 +737,23 @@ async def vector_search_vectors(bot_id: str, request: VectorSearchRequest):
         logger.error(f"❌ Vector search failed for bot {bot_id}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.post("/chunk")
+async def chunk_text_endpoint(request: ChunkRequest):
+    try:
+        chunks = SmartChunker.chunk_text(
+            request.text,
+            request.language,
+            request.max_chunk_length,
+            request.min_chunk_length,
+            request.overlap_ratio
+        )
+        logger.info(f"✓ Chunked via API: {len(chunks)} chunks for lang {request.language}")
+        return {"success": True, "chunks": chunks}
+    except Exception as e:
+        logger.error(f"❌ Chunking error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    
+    
 @app.post("/clear_index/{bot_id}")
 async def clear_index(bot_id: str): 
     try:

@@ -69,6 +69,9 @@ class VectorSearchRequest(BaseModel):
 class DeleteRequest(BaseModel):
     ids: List[str]
 
+class EmbeddingRequestBatch(BaseModel):
+    texts: List[str]
+
 class EmbeddingRequest(BaseModel):
     text: str
 
@@ -114,6 +117,38 @@ def generate_embedding(text: str) -> List[float]:
         logger.error(f"❌ Unexpected error in embedding: {type(e).__name__}: {str(e)} | Text preview: {text[:100]}...")
         raise HTTPException(status_code=500, detail=f"Embedding failed: {str(e)}")
 
+def generate_embedding_batch(texts: List[str]) -> List[List[float]]:
+    try:
+        if not texts:
+            return []
+
+
+        processed_texts = []
+        for text in texts:
+            if not text or not text.strip():
+                processed_texts.append("empty")  
+                continue
+
+            text = text.encode('utf-8', errors='ignore').decode('utf-8')
+            if len(text) > 8000:
+                text = text[:8000] + " [truncated]"
+
+            processed_texts.append(text)
+
+        response = client.embeddings.create(
+            model=EMBEDDING_MODEL,
+            input=processed_texts
+        )
+
+        embeddings = [data.embedding for data in response.data]
+        logger.info(f"✓ Generated {len(embeddings)} embeddings in one batch.")
+        return embeddings
+
+    except Exception as e:
+        logger.error(f"❌ Unexpected error in BATCH embedding: {type(e).__name__}: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Batch Embedding failed: {str(e)}")
+
+
 # ==================== SMART CHUNKER ====================
 class SmartChunker:
     """Improved text chunking with SENTENCE-BASED overlap (no more cut-off words!)"""
@@ -133,22 +168,12 @@ class SmartChunker:
             'sentence_delimiters': r'(?<=[。！？])\s*',
             'paragraph_delimiters': r'\n{1,}',
             'cjk_delims': r'[ \t\n\r\0\x0B。！？、；：（）「」『』]'
-        },
-        'zh': {
-            'sentence_delimiters': r'(?<=[。！？])\s*',
-            'paragraph_delimiters': r'\n{1,}',
-            'cjk_delims': r'[ \t\n\r\0\x0B。！？、；：（）「」『』]'
-        },
-        'ko': {
-            'sentence_delimiters': r'(?<=[.!?])\s*',
-            'paragraph_delimiters': r'\n{1,}',
-            'cjk_delims': r'[ \t\n\r\0\x0B。！？、；：（）「」『』]'
         }
     }
     
     @classmethod
     def is_char_based(cls, language: str) -> bool:
-        return language in ['ja', 'zh', 'ko']
+        return language in ['ja']
     
     @classmethod
     def calculate_length(cls, text: str, language: str) -> int:
@@ -604,58 +629,58 @@ class FAISSService:
             return []
 
     def delete_vectors(self, ids: List[str]) -> List[bool]:
-        """Delete vectors (rebuild approach with regeneration fallback)"""
+        """
+         Delete vectors (rebuild approach WITHOUT re-embedding)
+        This method reconstructs the index from existing vectors, avoiding costly API calls.
+        """
         try:
             logger.info(f"🗑️ Deleting {len(ids)} vectors for bot {self.bot_id}")
-            
-            delete_mask = [False] * len(self.documents)
-            for i, doc in enumerate(self.documents):
-                vid = doc.get('vector_id', f"content_{i}")
-                if vid in ids:
-                    delete_mask[i] = True
-            
-            # Collect kept docs and regenerate vectors for them
-            kept_docs = [doc for i, doc in enumerate(self.documents) if not delete_mask[i]]
-            results = [vid in ids for vid in [doc.get('vector_id', f"content_{i}") for i, doc in enumerate(self.documents)]]
-            
-            if len(kept_docs) == 0:
-                # Clear all for this bot
-                self.clear_index()
-                logger.info(f"✓ Cleared entire index for bot {self.bot_id}")
-                return results[:len(ids)]  # Partial match
-            
-            new_embeddings = []
-            for doc in kept_docs:
-                try:
-                    content = doc.get('content', '')
-                    if content:
-                        emb = generate_embedding(content) 
-                        new_embeddings.append(emb)
-                    else:
-                        logger.warning(f"⚠ Skip regen for doc without content in bot {self.bot_id}: {doc.get('vector_id')}")
-                        new_embeddings.append(np.zeros(self.dimension, dtype=np.float32)) 
-                except Exception as e:
-                    logger.warning(f"⚠ Regen failed for {doc.get('vector_id')} in bot {self.bot_id}: {e}")
-                    new_embeddings.append(np.zeros(self.dimension, dtype=np.float32))
-            
-            # Rebuild index
-            embeddings_array = np.array(new_embeddings, dtype=np.float32)
-            faiss.normalize_L2(embeddings_array)
+            if self.index.ntotal == 0:
+                 logger.warning(f"⚠ Index empty, nothing to delete for bot {self.bot_id}")
+                 return [False] * len(ids)
+
+            old_index = self.index
+            old_documents = self.documents[:]
+
+            indices_to_remove = set()
+            ids_to_remove = set(ids)
+            results_map = {vid: False for vid in ids}
+
+            for i, doc in enumerate(old_documents):
+                 vid = doc.get('vector_id', f"content_{i}")
+                 if vid in ids_to_remove:
+                     indices_to_remove.add(i)
+                     results_map[vid] = True 
+                     
+            if not indices_to_remove:
+                logger.warning(f"⚠ No matching vectors found to delete for bot {self.bot_id}")
+                return [results_map.get(vid, False) for vid in ids]
+
+
+            indices_to_keep = [i for i in range(old_index.ntotal) if i not in indices_to_remove]
+            kept_docs = [old_documents[i] for i in indices_to_keep]
+            if not kept_docs:
+                 self.clear_index()
+                 logger.info(f"✓ Cleared entire index for bot {self.bot_id} as no vectors remain.")
+                 return [results_map.get(vid, False) for vid in ids]
+            logger.info(f"Reconstructing {len(indices_to_keep)} vectors from old index...")
+            all_old_vectors = old_index.reconstruct_n(0, old_index.ntotal)
+            new_embeddings = all_old_vectors[indices_to_keep]
+
             self.index = faiss.IndexFlatIP(self.dimension)
-            self.index.add(embeddings_array)
+            self.index.add(new_embeddings)
             self.documents = kept_docs
             self.id_to_index = {doc.get('vector_id', f"content_{i}"): i for i, doc in enumerate(self.documents)}
-            
+ 
             faiss.write_index(self.index, self.index_path)
             self._save_metadata()
-            
-            logger.info(f"✓ Deleted for bot {self.bot_id}. Remaining: {len(self.documents)} vectors")
-            return results
+    
+            logger.info(f"✓ Deleted for bot {self.bot_id}. Remaining: {len(self.documents)} vectors (Rebuilt from existing vectors)")
+            return [results_map.get(vid, False) for vid in ids]
             
         except Exception as e:
             logger.error(f"❌ Delete error for bot {self.bot_id}: {e}")
-            raise HTTPException(status_code=500, detail=f"Delete failed: {str(e)}")
-
+            raise HTTPException(status_code=500, detail=f"Delete failed: {str(e)}") 
     def clear_index(self) -> bool:
         try:
             bot_dir = os.path.dirname(self.index_path)
@@ -686,6 +711,20 @@ async def generate_embedding_endpoint(request: EmbeddingRequest):
     except Exception as e:
         logger.error(f"❌ Endpoint error: {str(e)}")
         raise HTTPException(status_code=500, detail="Internal embedding error")
+
+@app.post("/generate_embeddings_batch")
+async def generate_embeddings_batch_endpoint(request: EmbeddingRequestBatch):
+    try:
+        embeddings = generate_embedding_batch(request.texts)
+        return {"success": True, "embeddings": embeddings}
+
+    except HTTPException:
+        raise
+
+    except Exception as e:
+        logger.error(f"❌ Endpoint batch embedding error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal batch embedding error")
+
 
 @app.post("/upsert/{bot_id}")
 async def upsert_vectors(bot_id: str, vectors: List[VectorData]): 
@@ -791,7 +830,7 @@ async def root():
         "features": [
             "Hybrid search (semantic + keyword)",
             "Cross-encoder re-ranking" if cross_encoder else "Basic hybrid search",
-            "Multi-language support (vi, en, ja, zh, ko)",
+            "Multi-language support (vi, en, ja)",
             "Configurable via .env (model, threshold)",
             "Per-bot isolation (faiss_index/{bot_id}/)"
         ]

@@ -44,10 +44,10 @@ except ImportError:
     LANGDETECT_AVAILABLE = False
     logger.warning("⚠ langdetect not installed, using basic detection")
 
-# Env vars for models/thresholds
+# Env vars for models
 EMBEDDING_MODEL = os.getenv('OPENAI_EMBEDDING_MODEL', 'text-embedding-3-small')
-MIN_SCORE_THRESHOLD = float(os.getenv('MIN_SCORE_THRESHOLD', 0.5))
-logger.info(f"✓ Config: Embedding model={EMBEDDING_MODEL}, Min threshold={MIN_SCORE_THRESHOLD}")
+# MIN_SCORE_THRESHOLD is now passed from PHP (bot->min_score_threshold / 100)
+logger.info(f"✓ Config: Embedding model={EMBEDDING_MODEL}")
 
 class VectorData(BaseModel):
     id: str
@@ -58,13 +58,13 @@ class SearchRequest(BaseModel):
     query: str
     language: str
     top_k: int = 5
-    threshold: float = MIN_SCORE_THRESHOLD   
+    threshold: float  # Required, passed from PHP with bot->min_score_threshold / 100
 
 class VectorSearchRequest(BaseModel):
     vector: List[float]
     language: str
     top_k: int = 5
-    threshold: float = MIN_SCORE_THRESHOLD 
+    threshold: float  # Required, passed from PHP with bot->min_score_threshold / 100
 
 class DeleteRequest(BaseModel):
     ids: List[str]
@@ -497,7 +497,7 @@ class FAISSService:
             logger.error(f"❌ Upsert error for bot {self.bot_id}: {e}")
             raise HTTPException(status_code=500, detail=f"Upsert failed: {str(e)}")
 
-    def hybrid_search(self, query: str, language: str, top_k: int = 5, threshold: float = MIN_SCORE_THRESHOLD) -> List[Dict]:
+    def hybrid_search(self, query: str, language: str, top_k: int = 5, threshold: float = 0.15) -> List[Dict]:
         """
         Hybrid search: Semantic + Keyword + Re-ranking (if available)
         """
@@ -582,7 +582,7 @@ class FAISSService:
             logger.error(f"❌ Hybrid search error for bot {self.bot_id}: {e}")
             return []
 
-    def vector_search(self, vector: List[float], language: str, top_k: int = 5, threshold: float = MIN_SCORE_THRESHOLD) -> List[Dict]:
+    def vector_search(self, vector: List[float], language: str, top_k: int = 5, threshold: float = 0.15) -> List[Dict]:
         """Direct vector search (legacy support)"""
         try:
             if self.index.ntotal == 0:
